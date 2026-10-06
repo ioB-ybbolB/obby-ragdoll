@@ -67,9 +67,26 @@
     const loaderUrl = buildUrl + '/or.loader.js';
 
     const config = {
-      dataUrl: buildUrl + '/or.data',
+      dataParts: [
+        'Build/or.data.part00',
+        'Build/or.data.part01',
+        'Build/or.data.part02',
+        'Build/or.data.part03'
+      ],
       frameworkUrl: buildUrl + '/or.framework.js',
-      codeUrl: buildUrl + '/or.wasm',
+      codeParts: [
+        'Build/or.wasm.part00',
+        'Build/or.wasm.part01',
+        'Build/or.wasm.part02',
+        'Build/or.wasm.part03',
+        'Build/or.wasm.part04',
+        'Build/or.wasm.part05',
+        'Build/or.wasm.part06',
+        'Build/or.wasm.part07',
+        'Build/or.wasm.part08',
+        'Build/or.wasm.part09',
+        'Build/or.wasm.part10'
+      ],
       streamingAssetsUrl: 'StreamingAssets',
       companyName: 'Unity',
       productName: 'Obby Ragdoll',
