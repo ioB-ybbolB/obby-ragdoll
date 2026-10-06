@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#111318" />
+  <title>Unity WebGL Launcher</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; background: #0b0d10; color: #eef1f6; overflow: hidden; }
+    #shell { position: relative; width: 100%; height: 100%; display: grid; place-items: center; }
+    #unity-canvas { width: 100%; height: 100%; background: #000; display: block; }
+    #overlay { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; pointer-events: none; }
+    #panel { width: min(680px, 92vw); background: rgba(18, 21, 27, .94); border: 1px solid rgba(255,255,255,.12); border-radius: 18px; padding: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.5); pointer-events: auto; }
+    h1 { margin: 0 0 10px; font-size: 24px; }
+    p { margin: 8px 0; line-height: 1.5; color: #c9d0dc; }
+    code { background: #0a0c10; border: 1px solid rgba(255,255,255,.09); padding: 2px 6px; border-radius: 6px; color: #fff; }
+    #progress-wrap { margin-top: 18px; height: 10px; border-radius: 99px; background: #252a34; overflow: hidden; }
+    #progress { width: 0%; height: 100%; background: #d8dde8; transition: width .12s linear; }
+    #status { margin-top: 12px; font-size: 14px; white-space: pre-wrap; }
+    #actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    button { border: 1px solid rgba(255,255,255,.16); background: #252a34; color: #fff; border-radius: 10px; padding: 10px 14px; font-weight: 650; cursor: pointer; }
+    button:hover { background: #303642; }
+    #fullscreen { position: absolute; right: 14px; bottom: 14px; z-index: 5; display: none; }
+    .error { color: #ffb6b6; }
+    .ok { color: #baf2c7; }
+    .muted { color: #8f98a8; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div id="shell">
+    <canvas id="unity-canvas" tabindex="-1"></canvas>
+    <button id="fullscreen" type="button">Fullscreen</button>
+    <div id="overlay">
+      <div id="panel">
+        <h1>Unity WebGL Launcher</h1>
+        <p id="message">Checking the build files…</p>
+        <div id="progress-wrap"><div id="progress"></div></div>
+        <div id="status" class="muted"></div>
+        <div id="actions"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('unity-canvas');
+    const overlay = document.getElementById('overlay');
+    const panel = document.getElementById('panel');
+    const message = document.getElementById('message');
+    const status = document.getElementById('status');
+    const progress = document.getElementById('progress');
+    const actions = document.getElementById('actions');
+    const fullscreen = document.getElementById('fullscreen');
+
+    const buildUrl = 'Build';
+    const loaderUrl = buildUrl + '/or.loader.js';
+    const frameworkUrl = buildUrl + '/or.framework.js';
+    const dataUrl = buildUrl + '/or.data.br';
+    const codeUrl = buildUrl + '/or.wasm.br';
+
+    const config = {
+      dataUrl,
+      frameworkUrl,
+      codeUrl,
+      streamingAssetsUrl: 'StreamingAssets',
+      companyName: 'Unknown',
+      productName: 'Unity WebGL Game',
+      productVersion: '1.0'
+    };
+
+    function setStatus(text, className = 'muted') {
+      status.textContent = text;
+      status.className = className;
+    }
+
+    function addReloadButton() {
+      const b = document.createElement('button');
+      b.textContent = 'Reload';
+      b.onclick = () => location.reload();
+      actions.replaceChildren(b);
+    }
+
+    async function exists(url) {
+      try {
+        const r = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+        return r.ok;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    async function boot() {
+      if (location.protocol === 'file:') {
+        message.textContent = 'This Unity WebGL build must be served over HTTP.';
+        setStatus('Run run_server.py (or one of the start scripts), then open the localhost address it prints.', 'error');
+        addReloadButton();
+        return;
+      }
+
+      const required = [
+        [dataUrl, 'or.data.br'],
+        [codeUrl, 'or.wasm.br'],
+        [frameworkUrl, 'or.framework.js'],
+        [loaderUrl, 'or.loader.js']
+      ];
+
+      const checks = await Promise.all(required.map(async ([url, name]) => [name, await exists(url)]));
+      const missing = checks.filter(([, ok]) => !ok).map(([name]) => name);
+
+      if (missing.length) {
+        message.textContent = 'The Unity build is incomplete.';
+        setStatus(
+          'Missing required file' + (missing.length > 1 ? 's' : '') + ':\n• ' + missing.join('\n• ') +
+          '\n\nOne or more Unity WebGL runtime files are missing from the Build folder.',
+          'error'
+        );
+        progress.style.width = '0%';
+        addReloadButton();
+        return;
+      }
+
+      message.textContent = 'Loading Unity…';
+      setStatus('Initializing WebGL runtime…');
+
+      const script = document.createElement('script');
+      script.src = loaderUrl;
+      script.onload = () => {
+        if (typeof createUnityInstance !== 'function') {
+          message.textContent = 'Unity loader did not initialize correctly.';
+          setStatus('The provided or.loader.js does not expose createUnityInstance(). Make sure it is from the same Unity WebGL build.', 'error');
+          addReloadButton();
+          return;
+        }
+
+        createUnityInstance(canvas, config, p => {
+          progress.style.width = Math.round(p * 100) + '%';
+          setStatus('Loading… ' + Math.round(p * 100) + '%');
+        }).then(instance => {
+          window.unityInstance = instance;
+          overlay.style.display = 'none';
+          fullscreen.style.display = 'block';
+          fullscreen.onclick = () => instance.SetFullscreen(1);
+        }).catch(err => {
+          message.textContent = 'Unity failed to start.';
+          setStatus(String(err && err.message ? err.message : err), 'error');
+          addReloadButton();
+        });
+      };
+      script.onerror = () => {
+        message.textContent = 'Could not load the Unity loader.';
+        setStatus('Failed to load ' + loaderUrl, 'error');
+        addReloadButton();
+      };
+      document.body.appendChild(script);
+    }
+
+    boot();
+  </script>
+</body>
+</html>
