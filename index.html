@@ -59,6 +59,8 @@
     <div class="spinner"></div>
   </div>
 
+  <script src="Build/yandex-compat.js"></script>
+
   <script>
     const canvas = document.getElementById('unity-canvas');
     const loading = document.getElementById('loading');
@@ -104,6 +106,7 @@
       createUnityInstance(canvas, config)
         .then(instance => {
           window.unityInstance = instance;
+          if (typeof SetYandexCompatUnityInstance === 'function') SetYandexCompatUnityInstance(instance);
           hideLoading();
         })
         .catch(error => {
