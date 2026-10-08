@@ -202,10 +202,10 @@ var prog = chainProgress(preCap, function(p){
 <script>
   const buildUrl  = "/Build";
   const config = {
-    dataUrl:      buildUrl + "/or.data.br",
-    frameworkUrl: buildUrl + "/data.js",
-    codeUrl:      buildUrl + "/or.wasm.br",
-    innerLoaderUrl: buildUrl + "/loader.js",
+    dataUrl:      buildUrl + "/or.data.js", // make this use or.data.part00 and or.data.part01 and so on until part03
+    frameworkUrl: buildUrl + "/or.framework.js",
+    codeUrl:      buildUrl + "/or.wasm.js", // make this use or.wasm.part00 and or.wasm.part01 and so on until part10
+    innerLoaderUrl: buildUrl + "/or.loader.js",
     streamingAssetsUrl: "StreamingAssets",
   };
 
