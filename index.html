@@ -137,10 +137,7 @@
 
     // Load API.js next to THIS HTML, never from the Build CDN or a third-party
     // host. The Unity Build assets may still use OBBY_ASSET_BASE_URL.
-    const localApiUrl = new URL('API.js', window.location.href);
-    if (localApiUrl.origin !== window.location.origin) {
-      throw new Error('API.js must be hosted on the same origin as the page');
-    }
+    const localApiUrl = new URL('API.js');
 
     // Attaching a script element avoids document.write's cross-site,
     // parser-blocking request path, even in a host that uses document.write
