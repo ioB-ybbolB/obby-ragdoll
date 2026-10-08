@@ -8,13 +8,19 @@
   <style>
     * { box-sizing: border-box; }
 
-    html,
-    body {
+    html, body {
       width: 100%;
       height: 100%;
       margin: 0;
       overflow: hidden;
       background: #000;
+    }
+
+    body {
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
     }
 
     #unity-canvas {
@@ -84,16 +90,33 @@
       white-space: nowrap;
     }
 
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
+
+  <!-- The existing compatibility bridge may provide real/stub Yandex functions. -->
+  <script src="Build/yandex-compat.js"></script>
+
+  <!-- These two integration scripts are present in the earlier reconstructed page. -->
+  <script>
+    window.SDK_OPTIONS = {
+      gameId: 'r2tzpy9cgrn2u4xgzc9z0zbtvxm16mby',
+      onEvent: function (event) {
+        switch (event && event.name) {
+          case 'SDK_GAME_PAUSE': break;
+          case 'SDK_GAME_START': break;
+          case 'SDK_READY': break;
+        }
+      }
+    };
+  </script>
+  <script id="gamemonetize-sdk" src="https://cdn.jsdelivr.net/gh/st39/sdk@main/sdkjs.js" async></script>
 </head>
 <body>
   <canvas id="unity-canvas" tabindex="-1"></canvas>
+
   <div id="loading" aria-label="Loading">
     <div class="loading-inner">
-      <div class="spinner"></div>
+      <div class="spinner" id="loading-spinner"></div>
       <div class="download-progress">
         <div
           id="progress-track"
@@ -111,18 +134,19 @@
     </div>
   </div>
 
-  <script src="Build/yandex-compat.js"></script>
-
   <script>
+    'use strict';
+
+    // -------- The original split-file loader: keep part merging and byte progress. --------
     const canvas = document.getElementById('unity-canvas');
     const loading = document.getElementById('loading');
     const progressTrack = document.getElementById('progress-track');
     const progressFill = document.getElementById('progress-fill');
     const byteCount = document.getElementById('byte-count');
+    const spinner = document.getElementById('loading-spinner');
 
     const buildUrl = 'Build';
     const loaderUrl = buildUrl + '/or.loader.js';
-
     const dataPartSizes = [4900000, 4900000, 4900000, 4484804];
     const codePartSizes = [
       4900000, 4900000, 4900000, 4900000, 4900000, 4900000,
@@ -133,9 +157,8 @@
 
     function updateSplitDownloadProgress(loaded, total) {
       const safeTotal = total || splitTotalBytes;
-      const safeLoaded = Math.min(loaded, safeTotal);
+      const safeLoaded = Math.max(0, Math.min(loaded, safeTotal));
       const percent = safeTotal > 0 ? (safeLoaded / safeTotal) * 100 : 0;
-
       progressFill.style.width = percent.toFixed(3) + '%';
       progressTrack.setAttribute('aria-valuemax', String(safeTotal));
       progressTrack.setAttribute('aria-valuenow', String(safeLoaded));
@@ -180,25 +203,534 @@
       setTimeout(() => loading.remove(), 200);
     }
 
+    function showLoadFailure(error) {
+      console.error('Unity failed to start:', error);
+      spinner.style.display = 'none';
+      byteCount.textContent = 'Load failed';
+    }
+
+    function FocusGame() {
+      window.focus();
+      try { canvas.focus(); } catch (_) {}
+    }
+    window.FocusGame = FocusGame;
+    document.addEventListener('contextmenu', e => e.preventDefault());
+    window.addEventListener('pointerdown', FocusGame);
+    window.addEventListener('touchstart', FocusGame);
+
+    var myGameInstance = null;
+    var StartUnityInstance = null;
+    var isGameLoaded = false;
+
+    // Callbacks sent before Unity is available are replayed once the engine starts.
+    // Store only latest state message per method to avoid replaying stale data.
+    const bufferedUnityState = new Map();
+    const STATE_METHODS = new Set([
+      'SetAuth', 'SetLoadSaves', 'SetEnvirData', 'PaymentsEntries', 'LeaderboardEntries'
+    ]);
+
+    function sendYG(method, arg) {
+      if (!myGameInstance || typeof myGameInstance.SendMessage !== 'function') {
+        if (STATE_METHODS.has(method)) bufferedUnityState.set(method, arg);
+        return;
+      }
+      for (const objectName of ['YG2Instance', 'YandexGame']) {
+        try {
+          if (arg === undefined) myGameInstance.SendMessage(objectName, method);
+          else myGameInstance.SendMessage(objectName, method, String(arg));
+        } catch (error) {
+          // Either GameObject may not exist in a given Unity build.
+        }
+      }
+    }
+
+    function flushUnityState() {
+      for (const [method, arg] of bufferedUnityState.entries()) sendYG(method, arg);
+      bufferedUnityState.clear();
+    }
+
+    function YG2Instance(method, arg) { sendYG(method, arg); }
+    function LogStyledMessage(msg, style) {
+      console.log('%c' + String(msg ?? ''), style || 'color:#FFDF73;background:#454545');
+    }
+
+    // -------- Save/load, player, payment and API compatibility from earlier page. --------
+    const FORCED_LANG = 'en';
+    let environmentData = 'no data';
+    window.environmentData = environmentData;
+    let reviewData = 'false';
+    let cloudSaves = 'no data';
+    let paymentsData = 'no data';
+    let playerData = 'no data';
+    let player = null;
+    let payments = null;
+    let platformSDK = null;
+    let initGame = false;
+    let nowFullAdOpen = false;
+    let sdkReady = false;
+    let _pendingSave = null;
+    let lastAdTime = 0;
+
+    const LOCAL_APP_KEY = 'yg2_cloud_' + (location.host + location.pathname);
+    function loadLocalPlayerCache() {
+      try { return JSON.parse(localStorage.getItem(LOCAL_APP_KEY) || '{}') || {}; }
+      catch (_) { return {}; }
+    }
+    function storeLocalPlayerCache(cache) {
+      try { localStorage.setItem(LOCAL_APP_KEY, JSON.stringify(cache)); return true; }
+      catch (_) { return false; }
+    }
+
+    // Used only when Build/yandex-compat.js (or a native platform SDK) did
+    // not already provide YaGames. This is LOCAL storage, not cross-device cloud.
+    function makeLocalYandexFallback() {
+      const isM = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+      const localPlayer = {
+        isAuthorized: () => true,
+        getMode: () => 'full',
+        getName: () => 'Guest',
+        getPhoto: () => '',
+        getUniqueID: () => 'guest_' + (location.host || 'local'),
+        getPayingStatus: () => 'unknown',
+        setData: (obj, flush) => {
+          if (obj && typeof obj === 'object') {
+            const cache = { ...loadLocalPlayerCache(), ...obj };
+            // Persist even for flush=false in local mode so reloads can restore.
+            storeLocalPlayerCache(cache);
+          }
+          return Promise.resolve();
+        },
+        getData: (keys) => {
+          const cache = loadLocalPlayerCache();
+          return Promise.resolve(Array.isArray(keys) && keys.length
+            ? keys.reduce((acc, key) => { acc[key] = cache[key]; return acc; }, {})
+            : cache);
+        }
+      };
+      const instance = {
+        __localFallback: true,
+        environment: {
+          i18n: { lang: FORCED_LANG, tld: 'com' },
+          app: { id: 'stub.app.id' },
+          browser: { lang: FORCED_LANG },
+          payload: null
+        },
+        deviceInfo: {
+          type: isM ? 'mobile' : 'desktop',
+          isMobile: () => isM,
+          isDesktop: () => !isM,
+          isTablet: () => /iPad|Tablet/i.test(navigator.userAgent),
+          isTV: () => false
+        },
+        screen: { fullscreen: { status: 'off', request() { this.status = 'on'; } } },
+        adv: {
+          showFullscreenAdv({ callbacks } = {}) {
+            callbacks?.onOpen?.();
+            callbacks?.onClose?.(true); // simulated in local compatibility mode
+          },
+          showRewardedVideo({ callbacks } = {}) {
+            callbacks?.onOpen?.();
+            setTimeout(() => { callbacks?.onRewarded?.(); callbacks?.onClose?.(); }, 300); // simulated
+          }
+        },
+        features: { LoadingAPI: { ready() {} } },
+        serverTime: () => Date.now(),
+        feedback: {
+          canReview: () => Promise.resolve({ value: false }),
+          requestReview: () => Promise.resolve({ feedbackSent: false })
+        },
+        auth: { openAuthDialog: () => Promise.resolve() },
+        getPlayer: () => Promise.resolve(localPlayer),
+        getPayments: () => Promise.reject(new Error('payments-unavailable')),
+        getLeaderboards: () => Promise.reject(new Error('leaderboards-unavailable'))
+      };
+      return instance;
+    }
+
+    if (!window.YaGames || typeof window.YaGames.init !== 'function') {
+      window.YaGames = { init: () => Promise.resolve(makeLocalYandexFallback()) };
+    }
+
+    function SaveCloud(jsonData, flush) {
+      if (!player || !sdkReady) {
+        _pendingSave = { jsonData, flush };
+        return Promise.resolve();
+      }
+      try {
+        return Promise.resolve(player.setData({ saves: [jsonData] }, !!flush))
+          .catch(error => console.error('CRASH Save Cloud:', error));
+      } catch (error) {
+        console.error('CRASH Save Cloud:', error);
+        return Promise.resolve();
+      }
+    }
+
+    async function LoadCloud() {
+      let value = 'no data';
+      try {
+        if (player && typeof player.getData === 'function') {
+          const data = await player.getData(['saves']);
+          value = data && data.saves != null ? JSON.stringify(data.saves) : 'no data';
+        }
+      } catch (error) {
+        console.warn('Cloud load failed:', error);
+      }
+      cloudSaves = value;
+      sendYG('SetLoadSaves', value);
+      return value;
+    }
+
+    async function flushPendingSave() {
+      if (!_pendingSave || !player || !sdkReady) return;
+      const pending = _pendingSave;
+      _pendingSave = null;
+      await SaveCloud(pending.jsonData, pending.flush);
+    }
+
+    function RequestingEnvironmentData() {
+      const isM = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+      const platformEnv = platformSDK && platformSDK.environment;
+      const json = JSON.stringify({
+        language: FORCED_LANG,
+        domain: (platformEnv && platformEnv.i18n && platformEnv.i18n.tld) || 'com',
+        deviceType: isM ? 'mobile' : 'desktop',
+        isMobile: isM,
+        isDesktop: !isM,
+        isTablet: /iPad|Tablet/i.test(navigator.userAgent),
+        isTV: false,
+        appID: (platformEnv && platformEnv.app && platformEnv.app.id) || 'stub.app.id',
+        browserLang: FORCED_LANG,
+        payload: (platformEnv && platformEnv.payload) || null,
+        platform: navigator.platform,
+        browser: 'Other'
+      });
+      environmentData = json;
+      window.environmentData = json;
+      sendYG('SetEnvirData', json);
+      return json;
+    }
+
+    async function InitPlayer() {
+      try {
+        if (!platformSDK || typeof platformSDK.getPlayer !== 'function') throw new Error('Player API unavailable');
+        const p = await platformSDK.getPlayer();
+        player = p;
+        await flushPendingSave();
+        const authJson = {
+          playerAuth: 'resolved',
+          playerName: typeof p.getName === 'function' ? p.getName() : 'Guest',
+          playerId: typeof p.getUniqueID === 'function' ? p.getUniqueID() : 'unauthorized',
+          playerPhoto: (typeof p.getPhoto === 'function' && p.getPhoto('medium')) || 'null',
+          payingStatus: typeof p.getPayingStatus === 'function' ? p.getPayingStatus() : 'unknown'
+        };
+        playerData = JSON.stringify(authJson);
+      } catch (error) {
+        playerData = JSON.stringify({
+          playerAuth: 'rejected',
+          playerName: 'unauthorized',
+          playerId: 'unauthorized',
+          playerPhoto: 'null',
+          payingStatus: 'unknown'
+        });
+      }
+      sendYG('SetAuth', playerData);
+      return playerData;
+    }
+
+    // Match the catalogue JSON fields/IDs from the prior version. The catalogue
+    // is a fallback UI mock; $0.00 does not imply a working checkout.
+    function mockPaymentCatalogue() {
+      return {
+        id: ['starter_pack', 'mega_pack'],
+        title: ['Starter Pack', 'Mega Pack'],
+        description: ['100k coins + 1.5k crystals', '250k coins + 5k crystals'],
+        imageURI: ['', ''],
+        price: ['0.00', '0.00'],
+        priceValue: [0, 0],
+        priceCurrencyCode: ['USD', 'USD'],
+        currencyImageURL: ['', ''],
+        consumed: [true, true],
+        language: 'en'
+      };
+    }
+
+    async function InitPayments(sendback) {
+      try {
+        // Prefer the actual platform catalogue if its SDK is present.
+        if (platformSDK && !platformSDK.__localFallback && typeof platformSDK.getPayments === 'function') {
+          try {
+            payments = await platformSDK.getPayments();
+            if (payments && typeof payments.getCatalog === 'function') {
+              const catalog = await payments.getCatalog();
+              if (Array.isArray(catalog)) {
+                const toValue = (p, field, fallback = '') => p && p[field] != null ? p[field] : fallback;
+                const response = {
+                  id: catalog.map(p => toValue(p, 'id')),
+                  title: catalog.map(p => toValue(p, 'title')),
+                  description: catalog.map(p => toValue(p, 'description')),
+                  imageURI: catalog.map(p => toValue(p, 'imageURI')),
+                  price: catalog.map(p => toValue(p, 'price')),
+                  priceValue: catalog.map(p => toValue(p, 'priceValue', 0)),
+                  priceCurrencyCode: catalog.map(p => toValue(p, 'priceCurrencyCode')),
+                  currencyImageURL: catalog.map(p => toValue(p, 'currencyImageURL')),
+                  consumed: catalog.map(p => !!p.consumed),
+                  language: FORCED_LANG
+                };
+                paymentsData = JSON.stringify(response);
+                sendYG('PaymentsEntries', paymentsData);
+                return paymentsData;
+              }
+            }
+          } catch (error) {
+            console.warn('Payments SDK unavailable:', error);
+            payments = null;
+          }
+        }
+        paymentsData = JSON.stringify(mockPaymentCatalogue());
+      } catch (error) {
+        paymentsData = 'no data';
+      }
+      sendYG('PaymentsEntries', paymentsData);
+      return paymentsData;
+    }
+
+    async function BuyPayments(id) {
+      try {
+        if (!payments || typeof payments.purchase !== 'function') {
+          sendYG('OnPurchaseFailed', id);
+          return false;
+        }
+        const purchase = await payments.purchase(id);
+        // Purchase must resolve through the real SDK, not the mock catalogue.
+        ConsumePurchase(id, true, purchase);
+        FocusGame();
+        return true;
+      } catch (error) {
+        console.error('Purchase Failed:', error);
+        sendYG('OnPurchaseFailed', id);
+        FocusGame();
+        return false;
+      }
+    }
+
+    function ConsumePurchase(id, successful, purchase) {
+      if (!successful) {
+        sendYG('OnPurchaseFailed', id);
+        return;
+      }
+      sendYG('OnPurchaseSuccess', id);
+      // The original source had no completed consumePurchase implementation.
+      // Do not consume a purchase token without app-specific fulfillment logic.
+    }
+
+    function GetPayments() { return Promise.resolve(paymentsData); }
+    function Payments() { return InitPayments(); }
+    function ConsumePurchases() { /* Not implemented in the source version. */ }
+
+    // Original ad cooldown and Unity callback names.
+    function canShowAd() { return Date.now() - lastAdTime > 30000; }
+
+    function FullAdShow() {
+      if (!canShowAd()) { sendYG('CloseInterAdv', 'false'); return; }
+      if (nowFullAdOpen) return;
+      nowFullAdOpen = true;
+      lastAdTime = Date.now();
+      sendYG('OpenInterAdv');
+      const finish = (completed) => {
+        nowFullAdOpen = false;
+        sendYG('CloseInterAdv', String(!!completed));
+        FocusGame();
+      };
+      try {
+        if (platformSDK && !platformSDK.__localFallback && typeof platformSDK.adv?.showFullscreenAdv === 'function') {
+          let finished = false;
+          platformSDK.adv.showFullscreenAdv({ callbacks: {
+            onClose: (completed) => { if (!finished) { finished = true; finish(completed); } },
+            onError: () => { if (!finished) { finished = true; sendYG('ErrorInterAdv'); finish(false); } }
+          } });
+        } else if (window.sdk && typeof window.sdk.showBanner === 'function') {
+          window.sdk.showBanner();
+          setTimeout(() => finish(true), 3000); // Legacy fallback timer (not verified ad completion)
+        } else {
+          finish(false);
+        }
+      } catch (error) {
+        sendYG('ErrorInterAdv');
+        finish(false);
+      }
+    }
+
+    function RewardedShow(id) {
+      if (!canShowAd()) {
+        sendYG('RewardUnavailable');
+        sendYG('CloseRewardedAdv');
+        return;
+      }
+      lastAdTime = Date.now();
+      sendYG('OpenRewardedAdv');
+      let rewarded = false;
+      const rewardedOnce = () => {
+        if (!rewarded) { rewarded = true; sendYG('RewardAdv', id); }
+      };
+      let rewardClosed = false;
+      const close = () => {
+        if (rewardClosed) return;
+        rewardClosed = true;
+        sendYG('CloseRewardedAdv', String(rewarded));
+        FocusGame();
+      };
+      try {
+        if (platformSDK && !platformSDK.__localFallback && typeof platformSDK.adv?.showRewardedVideo === 'function') {
+          platformSDK.adv.showRewardedVideo({ callbacks: {
+            onRewarded: rewardedOnce,
+            onClose: close,
+            onError: () => { sendYG('ErrorRewardedAdv'); close(); }
+          } });
+        } else if (window.sdk && typeof window.sdk.showBanner === 'function') {
+          window.sdk.showBanner();
+          // Legacy demo fallback reproduces the old page's timed reward behavior.
+          setTimeout(() => { rewardedOnce(); close(); }, 3000);
+        } else {
+          // The old page granted a reward even without an ad provider. Preserve
+          // this only for local/test deployments, not on a real-money platform.
+          if (platformSDK && platformSDK.__localFallback) rewardedOnce();
+          else sendYG('RewardUnavailable');
+          close();
+        }
+      } catch (error) {
+        sendYG('ErrorRewardedAdv');
+        close();
+      }
+    }
+
+    function InterAdvShow() { FullAdShow(); }
+    function RewardedAdvShow(id) { RewardedShow(id); }
+    function StickyAdActivity(show) {}
+
+    function SetLeaderboard(name, score, extraData) {
+      try {
+        const key = 'lb_' + String(name || 'default');
+        const value = Number(score) || 0;
+        const best = Number(localStorage.getItem(key) || '0');
+        if (value > best) localStorage.setItem(key, String(value));
+      } catch (_) {}
+    }
+
+    function GetLeaderboard(nameLB, quantityTop, quantityAround, photoSize, auth) {
+      const payload = {
+        technoName: String(nameLB || ''),
+        isDefault: false,
+        isInvertSortOrder: false,
+        decimalOffset: 0,
+        type: 'numeric',
+        entries: 'no data',
+        ranks: [],
+        photos: [],
+        names: [],
+        scores: [],
+        uniqueIDs: [],
+        extraDataArray: []
+      };
+      sendYG('LeaderboardEntries', JSON.stringify(payload));
+      return payload;
+    }
+    function GetLeaderboardScores() {}
+    function InitReview() { reviewData = 'false'; }
+    function Review() {}
+    function flasgsData() {}
+    function OpenAuthDialog() {
+      // Same Unity callback as the previous page, plus SDK dialog when available.
+      if (platformSDK && !platformSDK.__localFallback && typeof platformSDK.auth?.openAuthDialog === 'function') {
+        Promise.resolve(platformSDK.auth.openAuthDialog()).finally(() => InitPlayer());
+      }
+      sendYG('GetDataInvoke');
+    }
+    function InitGame() { initGame = true; if (nowFullAdOpen) sendYG('OpenFullAd'); }
+    function GameReadyAPI() {
+      try { platformSDK?.features?.LoadingAPI?.ready?.(); } catch (_) {}
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (initGame) sendYG('SetFocusWindowGame', String(!document.hidden));
+    });
+
+    // Unity .jslib / YandexGame callable entry points from the previous page.
+    window._InitEnvironmentData_js = () => RequestingEnvironmentData();
+    window._InitPlayer_js = () => InitPlayer();
+    window._LoadCloud_js = () => LoadCloud();
+    window._SaveCloud_js = (jsonData, flush) => SaveCloud(jsonData, flush);
+    window._InterAdvShow_js = () => InterAdvShow();
+    window._RewardedAdvShow_js = (id) => RewardedAdvShow(id);
+    window._OpenAuthDialog_js = () => OpenAuthDialog();
+    window._InitPayments_js = () => InitPayments();
+    window._BuyPayments_js = (id) => BuyPayments(id);
+
+    // Keep the public global identifiers callable by Unity glue scripts.
+    Object.assign(window, {
+      SaveCloud, LoadCloud, InitPayments, BuyPayments, GetPayments,
+      FullAdShow, RewardedShow, InterAdvShow, RewardedAdvShow,
+      SetLeaderboard, GetLeaderboard, GetLeaderboardScores,
+      InitPlayer, RequestingEnvironmentData, OpenAuthDialog,
+      Payments, ConsumePurchases, ConsumePurchase, StickyAdActivity,
+      InitReview, Review, InitGame, GameReadyAPI, flasgsData,
+      YG2Instance, LogStyledMessage
+    });
+
+    async function bootstrapPlatform() {
+      try {
+        // Respect a preinitialized SDK supplied by Build/yandex-compat.js.
+        platformSDK = window.ysdk && typeof window.ysdk.getPlayer === 'function'
+          ? window.ysdk
+          : await window.YaGames.init();
+        // Some compatibility scripts return an SDK object but don't set window.ysdk.
+        window.ysdk = platformSDK;
+        sdkReady = true;
+        RequestingEnvironmentData();
+        await InitPlayer();
+        await LoadCloud();
+        await flushPendingSave();
+      } catch (error) {
+        console.warn('Platform SDK initialization failed; switching to local save mode.', error);
+        platformSDK = makeLocalYandexFallback();
+        window.ysdk = platformSDK;
+        sdkReady = true;
+        RequestingEnvironmentData();
+        await InitPlayer();
+        await LoadCloud();
+        await flushPendingSave();
+      }
+    }
+
+    // Start platform and Unity independently, just like the earlier page.
+    bootstrapPlatform();
+
     const script = document.createElement('script');
     script.src = loaderUrl;
     script.onload = () => {
-      createUnityInstance(canvas, config)
+      if (typeof window.createUnityInstance !== 'function') {
+        showLoadFailure(new Error('Build/or.loader.js did not expose createUnityInstance'));
+        return;
+      }
+      window.createUnityInstance(canvas, config)
         .then(instance => {
+          myGameInstance = instance;
+          window.myGameInstance = instance;
           window.unityInstance = instance;
-          if (typeof SetYandexCompatUnityInstance === 'function') SetYandexCompatUnityInstance(instance);
+          if (typeof window.SetYandexCompatUnityInstance === 'function') {
+            window.SetYandexCompatUnityInstance(instance);
+          }
+          isGameLoaded = true;
+          window.isGameLoaded = true;
+          flushUnityState();
           hideLoading();
         })
-        .catch(error => {
-          console.error('Unity failed to start:', error);
-          byteCount.textContent = 'Load failed';
-        });
+        .catch(showLoadFailure);
     };
-    script.onerror = error => {
-      console.error('Failed to load Unity loader:', error);
-      byteCount.textContent = 'Load failed';
-    };
+    script.onerror = error => showLoadFailure(error);
     document.body.appendChild(script);
   </script>
+
+  <!-- Preserved from the earlier reconstructed wrapper. Requires internet. -->
+  <script src="https://cdn.jsdelivr.net/gh/st39/sdk@main/api.js" defer></script>
 </body>
 </html>
