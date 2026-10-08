@@ -93,7 +93,7 @@
     @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 
-  <!-- Platform and ad SDKs are attached asynchronously below; no parser-blocking scripts. -->
+  <!-- Same-origin API.js and Unity scripts are loaded asynchronously at startup. -->
 </head>
 <body>
   <canvas id="unity-canvas" tabindex="-1"></canvas>
@@ -135,20 +135,11 @@
       ? window.OBBY_ASSET_BASE_URL.trim().replace(/\/+$/, '') : 'Build';
     const assetUrl = file => assetBase + '/' + file;
 
-    // The older external ads SDK is opt-in because ad blockers can block its
-    // IMA3/event requests. Real Yandex SDK ads are used when available.
-    const ENABLE_EXTERNAL_AD_SDK = window.OBBY_ENABLE_GAMEMONETIZE === true;
-    if (ENABLE_EXTERNAL_AD_SDK) {
-      window.SDK_OPTIONS = window.SDK_OPTIONS || {
-        gameId: 'r2tzpy9cgrn2u4xgzc9z0zbtvxm16mby',
-        onEvent(event) {
-          switch (event && event.name) {
-            case 'SDK_GAME_PAUSE': break;
-            case 'SDK_GAME_START': break;
-            case 'SDK_READY': break;
-          }
-        }
-      };
+    // Load API.js next to THIS HTML, never from the Build CDN or a third-party
+    // host. The Unity Build assets may still use OBBY_ASSET_BASE_URL.
+    const localApiUrl = new URL('API.js', window.location.href);
+    if (localApiUrl.origin !== window.location.origin) {
+      throw new Error('API.js must be hosted on the same origin as the page');
     }
 
     // Attaching a script element avoids document.write's cross-site,
@@ -354,12 +345,12 @@
         screen: { fullscreen: { status: 'off', request() { this.status = 'on'; } } },
         adv: {
           showFullscreenAdv({ callbacks } = {}) {
-            callbacks?.onOpen?.();
-            callbacks?.onClose?.(true); // simulated in local compatibility mode
+            callbacks?.onError?.(new Error('No interstitial provider configured'));
+            callbacks?.onClose?.(false);
           },
           showRewardedVideo({ callbacks } = {}) {
-            callbacks?.onOpen?.();
-            setTimeout(() => { callbacks?.onRewarded?.(); callbacks?.onClose?.(); }, 300); // simulated
+            callbacks?.onError?.(new Error('No rewarded provider configured'));
+            callbacks?.onClose?.(false);
           }
         },
         features: { LoadingAPI: { ready() {} } },
@@ -560,80 +551,105 @@
     function Payments() { return InitPayments(); }
     function ConsumePurchases() { /* Not implemented in the source version. */ }
 
-    // Original ad cooldown and Unity callback names.
-    function canShowAd() { return Date.now() - lastAdTime > 30000; }
+    // API.js contract: window.ObbyAPI.ads.showRewarded({id, onOpen,
+    // onRewarded, onClose, onError}); showInterstitial({onOpen,onClose,onError})
+    // A video reward is granted ONLY upon the provider's onRewarded callback.
+    // For Unity Yandex callbacks, the same events are sent as in the old page.
+    let rewardedAdInFlight = false;
+    const AD_CLOSE_TIMEOUT_MS = 120000;
+
+    function apiAds() {
+      const api = window.ObbyAPI;
+      return api && api.ads && typeof api.ads === 'object' ? api.ads : null;
+    }
+
+    function realPlatformAds() {
+      // Don't route through our own local fallback (or the compatibility shim).
+      // Local API.js is the source of truth for ads on independent domains.
+      const sdk = window.ObbyAPI?.platformSDK;
+      return sdk && !sdk.__localFallback && sdk.adv ? sdk.adv : null;
+    }
 
     function FullAdShow() {
-      if (!canShowAd()) { sendYG('CloseInterAdv', 'false'); return; }
       if (nowFullAdOpen) return;
       nowFullAdOpen = true;
-      lastAdTime = Date.now();
-      sendYG('OpenInterAdv');
-      const finish = (completed) => {
+      let closed = false;
+      let watchdog;
+      const onOpen = () => sendYG('OpenInterAdv');
+      const onClose = (completed) => {
+        if (closed) return;
+        closed = true;
+        if (watchdog) clearTimeout(watchdog);
         nowFullAdOpen = false;
-        sendYG('CloseInterAdv', String(!!completed));
+        sendYG('CloseInterAdv', String(completed === true));
         FocusGame();
       };
-      try {
-        if (platformSDK && !platformSDK.__localFallback && typeof platformSDK.adv?.showFullscreenAdv === 'function') {
-          let finished = false;
-          platformSDK.adv.showFullscreenAdv({ callbacks: {
-            onClose: (completed) => { if (!finished) { finished = true; finish(completed); } },
-            onError: () => { if (!finished) { finished = true; sendYG('ErrorInterAdv'); finish(false); } }
-          } });
-        } else if (window.sdk && typeof window.sdk.showBanner === 'function') {
-          window.sdk.showBanner();
-          setTimeout(() => finish(true), 3000); // Legacy fallback timer (not verified ad completion)
-        } else {
-          finish(false);
-        }
-      } catch (error) {
+      const onError = (error) => {
+        console.warn('Interstitial ad provider failed:', error);
         sendYG('ErrorInterAdv');
-        finish(false);
-      }
+        onClose(false);
+      };
+      try {
+        const ads = apiAds();
+        const sdkAdv = realPlatformAds();
+        let result;
+        if (ads && typeof ads.showInterstitial === 'function') {
+          result = ads.showInterstitial({ onOpen, onClose, onError });
+        } else if (sdkAdv && typeof sdkAdv.showFullscreenAdv === 'function') {
+          result = sdkAdv.showFullscreenAdv({ callbacks: { onOpen, onClose, onError } });
+        } else {
+          console.info('Interstitial ads need a provider registered in local API.js.');
+          onClose(false);
+          return;
+        }
+        watchdog = setTimeout(() => onError(new Error('Interstitial provider timed out')), AD_CLOSE_TIMEOUT_MS);
+        if (result && typeof result.then === 'function') result.catch(onError);
+      } catch (error) { onError(error); }
     }
 
     function RewardedShow(id) {
-      if (!canShowAd()) {
-        sendYG('RewardUnavailable');
-        sendYG('CloseRewardedAdv');
-        return;
-      }
-      lastAdTime = Date.now();
-      sendYG('OpenRewardedAdv');
+      // Rewarded ads should not share the 30-second interstitial cooldown.
+      if (rewardedAdInFlight) return;
+      rewardedAdInFlight = true;
       let rewarded = false;
-      const rewardedOnce = () => {
-        if (!rewarded) { rewarded = true; sendYG('RewardAdv', id); }
+      let closed = false;
+      let watchdog;
+      const onOpen = () => sendYG('OpenRewardedAdv');
+      const onRewarded = () => {
+        if (closed || rewarded) return;
+        rewarded = true;
+        sendYG('RewardAdv', String(id));
       };
-      let rewardClosed = false;
-      const close = () => {
-        if (rewardClosed) return;
-        rewardClosed = true;
+      const onClose = () => {
+        if (closed) return;
+        closed = true;
+        rewardedAdInFlight = false;
+        if (watchdog) clearTimeout(watchdog);
         sendYG('CloseRewardedAdv', String(rewarded));
         FocusGame();
       };
-      try {
-        if (platformSDK && !platformSDK.__localFallback && typeof platformSDK.adv?.showRewardedVideo === 'function') {
-          platformSDK.adv.showRewardedVideo({ callbacks: {
-            onRewarded: rewardedOnce,
-            onClose: close,
-            onError: () => { sendYG('ErrorRewardedAdv'); close(); }
-          } });
-        } else if (window.sdk && typeof window.sdk.showBanner === 'function') {
-          window.sdk.showBanner();
-          // Legacy demo fallback reproduces the old page's timed reward behavior.
-          setTimeout(() => { rewardedOnce(); close(); }, 3000);
-        } else {
-          // The old page granted a reward even without an ad provider. Preserve
-          // this only for local/test deployments, not on a real-money platform.
-          if (platformSDK && platformSDK.__localFallback) rewardedOnce();
-          else sendYG('RewardUnavailable');
-          close();
-        }
-      } catch (error) {
+      const onError = (error) => {
+        if (closed) return;
+        console.warn('Rewarded ad failed:', error);
         sendYG('ErrorRewardedAdv');
-        close();
-      }
+        if (!rewarded) sendYG('RewardUnavailable');
+        onClose();
+      };
+      try {
+        const ads = apiAds();
+        const sdkAdv = realPlatformAds();
+        let result;
+        if (ads && typeof ads.showRewarded === 'function') {
+          result = ads.showRewarded({ id, onOpen, onRewarded, onClose, onError });
+        } else if (sdkAdv && typeof sdkAdv.showRewardedVideo === 'function') {
+          result = sdkAdv.showRewardedVideo({ callbacks: { onOpen, onRewarded, onClose, onError } });
+        } else {
+          onError(new Error('Configure a rewarded provider in same-origin API.js (or enable explicit test mode)'));
+          return;
+        }
+        if (!closed) watchdog = setTimeout(() => onError(new Error('Rewarded ad provider timed out')), AD_CLOSE_TIMEOUT_MS);
+        if (result && typeof result.then === 'function') result.catch(onError);
+      } catch (error) { onError(error); }
     }
 
     function InterAdvShow() { FullAdShow(); }
@@ -687,7 +703,7 @@
       if (initGame) sendYG('SetFocusWindowGame', String(!document.hidden));
     });
 
-    // Unity .jslib / YandexGame callable entry points from the previous page.
+    function exposeUnityHooks() {
     window._InitEnvironmentData_js = () => RequestingEnvironmentData();
     window._InitPlayer_js = () => InitPlayer();
     window._LoadCloud_js = () => LoadCloud();
@@ -709,15 +725,52 @@
       YG2Instance, LogStyledMessage
     });
 
+    }
+    exposeUnityHooks();
+
+    function routeLegacyShimAdsThroughLocalAPI() {
+      // Some Unity bridges call ysdk.adv directly, bypassing our global
+      // _RewardedAdvShow_js hook. Intercept ONLY known standalone stubs or an
+      // explicit opt-in, never an authenticated real Yandex platform SDK.
+      const sdk = platformSDK;
+      const isStub = !!(sdk && (
+        sdk.__localFallback || sdk.__standaloneFallback ||
+        sdk.environment?.app?.id === 'stub.app.id'
+      ));
+      if ((!isStub && window.OBBY_ROUTE_PLATFORM_ADS_TO_LOCAL !== true) ||
+          sdk === window.ObbyAPI?.platformSDK || !sdk?.adv || !apiAds()) return;
+      try {
+        sdk.adv.showRewardedVideo = ({ callbacks = {} } = {}) =>
+          apiAds().showRewarded({
+            id: null,
+            onOpen: callbacks.onOpen,
+            onRewarded: callbacks.onRewarded,
+            onClose: callbacks.onClose,
+            onError: callbacks.onError
+          });
+        sdk.adv.showFullscreenAdv = ({ callbacks = {} } = {}) =>
+          apiAds().showInterstitial({
+            onOpen: callbacks.onOpen,
+            onClose: callbacks.onClose,
+            onError: callbacks.onError
+          });
+      } catch (error) {
+        console.warn('Could not replace standalone compatibility ad methods:', error);
+      }
+    }
+
     async function bootstrapPlatform() {
       try {
         // Respect a preinitialized SDK supplied by Build/yandex-compat.js.
-        platformSDK = window.ysdk && typeof window.ysdk.getPlayer === 'function'
-          ? window.ysdk
-          : await window.YaGames.init();
+        platformSDK = window.ObbyAPI?.platformSDK && typeof window.ObbyAPI.platformSDK.getPlayer === 'function'
+          ? window.ObbyAPI.platformSDK
+          : window.ysdk && typeof window.ysdk.getPlayer === 'function'
+            ? window.ysdk
+            : await window.YaGames.init();
         // Some compatibility scripts return an SDK object but don't set window.ysdk.
         window.ysdk = platformSDK;
         sdkReady = true;
+        routeLegacyShimAdsThroughLocalAPI();
         RequestingEnvironmentData();
         await InitPlayer();
         await LoadCloud();
@@ -727,6 +780,7 @@
         platformSDK = makeLocalYandexFallback();
         window.ysdk = platformSDK;
         sdkReady = true;
+        routeLegacyShimAdsThroughLocalAPI();
         RequestingEnvironmentData();
         await InitPlayer();
         await LoadCloud();
@@ -735,9 +789,16 @@
     }
 
     async function startGame() {
-      // Compatibility must initialize before Unity's loader to make its
-      // functions available to the player. Failure is not fatal: saves fall
-      // back to localStorage if the platform SDK is not available.
+      // API.js must live alongside this HTML on the same domain. Load it
+      // before any compatibility shim so its ads can override local stubs.
+      try {
+        await attachScript(localApiUrl.href, 'obby-local-api');
+      } catch (error) {
+        console.warn('Local API.js could not load. Saves will remain available; rewarded ads require a configured provider.', error);
+      }
+
+      // Compatibility remains optional for the Unity Yandex glue functions;
+      // API.js handles actual advertising on independent hosts.
       if (typeof window.SetYandexCompatUnityInstance !== 'function') {
         try {
           await attachScript(assetUrl('yandex-compat.js'), 'obby-yandex-compat');
@@ -746,19 +807,13 @@
         }
       }
 
+      // A legacy compatibility script can overwrite global ad functions.
+      // Rebind all entry points so the same-origin API.js always wins.
+      exposeUnityHooks();
       ensureLocalPlatformFallback();
       // Start SDK initialization and Unity loading independently once the
       // compatibility script has settled.
       bootstrapPlatform().catch(error => console.warn('SDK bootstrap failed:', error));
-
-      if (ENABLE_EXTERNAL_AD_SDK) {
-        // Optional ads are isolated from game startup; blocked ads must not
-        // prevent the Unity loader or local/cloud saves from starting.
-        attachScript('https://cdn.jsdelivr.net/gh/st39/sdk@main/sdkjs.js',
-          'obby-gamemonetize-sdk').catch(error => console.warn('Ad SDK unavailable:', error));
-        attachScript('https://cdn.jsdelivr.net/gh/st39/sdk@main/api.js',
-          'obby-gamemonetize-api').catch(error => console.warn('Ad API unavailable:', error));
-      }
 
       try {
         await attachScript(loaderUrl, 'obby-unity-loader');
