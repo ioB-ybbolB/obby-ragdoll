@@ -93,23 +93,7 @@
     @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 
-  <!-- The existing compatibility bridge may provide real/stub Yandex functions. -->
-  <script src="Build/yandex-compat.js"></script>
-
-  <!-- These two integration scripts are present in the earlier reconstructed page. -->
-  <script>
-    window.SDK_OPTIONS = {
-      gameId: 'r2tzpy9cgrn2u4xgzc9z0zbtvxm16mby',
-      onEvent: function (event) {
-        switch (event && event.name) {
-          case 'SDK_GAME_PAUSE': break;
-          case 'SDK_GAME_START': break;
-          case 'SDK_READY': break;
-        }
-      }
-    };
-  </script>
-  <script id="gamemonetize-sdk" src="https://cdn.jsdelivr.net/gh/st39/sdk@main/sdkjs.js" async></script>
+  <!-- Platform and ad SDKs are attached asynchronously below; no parser-blocking scripts. -->
 </head>
 <body>
   <canvas id="unity-canvas" tabindex="-1"></canvas>
@@ -135,7 +119,52 @@
   </div>
 
   <script>
+  (function () {
     'use strict';
+
+    // Safe when a host accidentally injects the page/script more than once.
+    // The IIFE also keeps `let`/`const` away from host page globals.
+    if (window.__obbyRagdollMergedBootstrapped) return;
+    window.__obbyRagdollMergedBootstrapped = true;
+
+    // Leave blank for a Build/ folder next to this HTML. When embedding the
+    // page on another domain, set OBBY_ASSET_BASE_URL to the full Build URL
+    // *before* inserting this HTML (e.g. https://cdn.example/.../Build).
+    const assetBase = typeof window.OBBY_ASSET_BASE_URL === 'string' &&
+      window.OBBY_ASSET_BASE_URL.trim()
+      ? window.OBBY_ASSET_BASE_URL.trim().replace(/\/+$/, '') : 'Build';
+    const assetUrl = file => assetBase + '/' + file;
+
+    // The older external ads SDK is opt-in because ad blockers can block its
+    // IMA3/event requests. Real Yandex SDK ads are used when available.
+    const ENABLE_EXTERNAL_AD_SDK = window.OBBY_ENABLE_GAMEMONETIZE === true;
+    if (ENABLE_EXTERNAL_AD_SDK) {
+      window.SDK_OPTIONS = window.SDK_OPTIONS || {
+        gameId: 'r2tzpy9cgrn2u4xgzc9z0zbtvxm16mby',
+        onEvent(event) {
+          switch (event && event.name) {
+            case 'SDK_GAME_PAUSE': break;
+            case 'SDK_GAME_START': break;
+            case 'SDK_READY': break;
+          }
+        }
+      };
+    }
+
+    // Attaching a script element avoids document.write's cross-site,
+    // parser-blocking request path, even in a host that uses document.write
+    // to inject the page itself.
+    function attachScript(src, id) {
+      return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.id = id;
+        script.src = src;
+        script.async = true;
+        script.onload = () => resolve(script);
+        script.onerror = () => reject(new Error('Failed to load ' + src));
+        document.head.appendChild(script);
+      });
+    }
 
     // -------- The original split-file loader: keep part merging and byte progress. --------
     const canvas = document.getElementById('unity-canvas');
@@ -145,8 +174,8 @@
     const byteCount = document.getElementById('byte-count');
     const spinner = document.getElementById('loading-spinner');
 
-    const buildUrl = 'Build';
-    const loaderUrl = buildUrl + '/or.loader.js';
+    const buildUrl = assetBase;
+    const loaderUrl = assetUrl('or.loader.js');
     const dataPartSizes = [4900000, 4900000, 4900000, 4484804];
     const codePartSizes = [
       4900000, 4900000, 4900000, 4900000, 4900000, 4900000,
@@ -169,25 +198,25 @@
 
     const config = {
       dataParts: [
-        'Build/or.data.part00',
-        'Build/or.data.part01',
-        'Build/or.data.part02',
-        'Build/or.data.part03'
+        assetUrl('or.data.part00'),
+        assetUrl('or.data.part01'),
+        assetUrl('or.data.part02'),
+        assetUrl('or.data.part03')
       ],
       dataPartSizes,
       frameworkUrl: buildUrl + '/or.framework.js',
       codeParts: [
-        'Build/or.wasm.part00',
-        'Build/or.wasm.part01',
-        'Build/or.wasm.part02',
-        'Build/or.wasm.part03',
-        'Build/or.wasm.part04',
-        'Build/or.wasm.part05',
-        'Build/or.wasm.part06',
-        'Build/or.wasm.part07',
-        'Build/or.wasm.part08',
-        'Build/or.wasm.part09',
-        'Build/or.wasm.part10'
+        assetUrl('or.wasm.part00'),
+        assetUrl('or.wasm.part01'),
+        assetUrl('or.wasm.part02'),
+        assetUrl('or.wasm.part03'),
+        assetUrl('or.wasm.part04'),
+        assetUrl('or.wasm.part05'),
+        assetUrl('or.wasm.part06'),
+        assetUrl('or.wasm.part07'),
+        assetUrl('or.wasm.part08'),
+        assetUrl('or.wasm.part09'),
+        assetUrl('or.wasm.part10')
       ],
       codePartSizes,
       splitTotalBytes,
@@ -347,8 +376,12 @@
       return instance;
     }
 
-    if (!window.YaGames || typeof window.YaGames.init !== 'function') {
-      window.YaGames = { init: () => Promise.resolve(makeLocalYandexFallback()) };
+    function ensureLocalPlatformFallback() {
+      // Only install our own YaGames when neither the real nor the bundled
+      // yandex-compat SDK has registered an init() method.
+      if (!window.YaGames || typeof window.YaGames.init !== 'function') {
+        window.YaGames = { init: () => Promise.resolve(makeLocalYandexFallback()) };
+      }
     }
 
     function SaveCloud(jsonData, flush) {
@@ -701,36 +734,55 @@
       }
     }
 
-    // Start platform and Unity independently, just like the earlier page.
-    bootstrapPlatform();
-
-    const script = document.createElement('script');
-    script.src = loaderUrl;
-    script.onload = () => {
-      if (typeof window.createUnityInstance !== 'function') {
-        showLoadFailure(new Error('Build/or.loader.js did not expose createUnityInstance'));
-        return;
+    async function startGame() {
+      // Compatibility must initialize before Unity's loader to make its
+      // functions available to the player. Failure is not fatal: saves fall
+      // back to localStorage if the platform SDK is not available.
+      if (typeof window.SetYandexCompatUnityInstance !== 'function') {
+        try {
+          await attachScript(assetUrl('yandex-compat.js'), 'obby-yandex-compat');
+        } catch (error) {
+          console.warn('Yandex compatibility bridge unavailable; using SDK/local fallback.', error);
+        }
       }
-      window.createUnityInstance(canvas, config)
-        .then(instance => {
-          myGameInstance = instance;
-          window.myGameInstance = instance;
-          window.unityInstance = instance;
-          if (typeof window.SetYandexCompatUnityInstance === 'function') {
-            window.SetYandexCompatUnityInstance(instance);
-          }
-          isGameLoaded = true;
-          window.isGameLoaded = true;
-          flushUnityState();
-          hideLoading();
-        })
-        .catch(showLoadFailure);
-    };
-    script.onerror = error => showLoadFailure(error);
-    document.body.appendChild(script);
-  </script>
 
-  <!-- Preserved from the earlier reconstructed wrapper. Requires internet. -->
-  <script src="https://cdn.jsdelivr.net/gh/st39/sdk@main/api.js" defer></script>
+      ensureLocalPlatformFallback();
+      // Start SDK initialization and Unity loading independently once the
+      // compatibility script has settled.
+      bootstrapPlatform().catch(error => console.warn('SDK bootstrap failed:', error));
+
+      if (ENABLE_EXTERNAL_AD_SDK) {
+        // Optional ads are isolated from game startup; blocked ads must not
+        // prevent the Unity loader or local/cloud saves from starting.
+        attachScript('https://cdn.jsdelivr.net/gh/st39/sdk@main/sdkjs.js',
+          'obby-gamemonetize-sdk').catch(error => console.warn('Ad SDK unavailable:', error));
+        attachScript('https://cdn.jsdelivr.net/gh/st39/sdk@main/api.js',
+          'obby-gamemonetize-api').catch(error => console.warn('Ad API unavailable:', error));
+      }
+
+      try {
+        await attachScript(loaderUrl, 'obby-unity-loader');
+        if (typeof window.createUnityInstance !== 'function') {
+          throw new Error('Unity loader did not expose createUnityInstance');
+        }
+        const instance = await window.createUnityInstance(canvas, config);
+        myGameInstance = instance;
+        window.myGameInstance = instance;
+        window.unityInstance = instance;
+        if (typeof window.SetYandexCompatUnityInstance === 'function') {
+          window.SetYandexCompatUnityInstance(instance);
+        }
+        isGameLoaded = true;
+        window.isGameLoaded = true;
+        flushUnityState();
+        hideLoading();
+      } catch (error) {
+        showLoadFailure(error);
+      }
+    }
+
+    window.__obbyRagdollStartupPromise = startGame();
+  }());
+  </script>
 </body>
 </html>
